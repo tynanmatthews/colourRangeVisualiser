@@ -5,6 +5,8 @@ from plotly.subplots import make_subplots
 import argparse
 import os
 from range_from_swatch import assert_input_colour_space
+from scipy.spatial.distance import pdist, squareform
+from scipy import stats
 
 def calculate_window_averages(image, window_size=100, color_space='RGB'):
     """
@@ -72,6 +74,55 @@ def hsv_to_rgb(hsv):
     hsv_pixel = np.array([[[h, s, v]]], dtype=np.uint8)
     rgb_pixel = cv2.cvtColor(hsv_pixel, cv2.COLOR_HSV2RGB)
     return rgb_pixel[0, 0]
+
+def filter_noise_from_distinct_windows(distinct_indices, z_threshold=2.0, k_neighbors=5):
+    """
+    Filter out noisy distinct windows by detecting spatial outliers.
+    
+    Args:
+        distinct_indices: List of (y, x) indices of distinct windows
+        z_threshold: Z-score threshold for identifying outliers
+        k_neighbors: Number of nearest neighbors to consider
+        
+    Returns:
+        filtered_indices: List of filtered distinct window indices
+    """
+    if len(distinct_indices) <= k_neighbors + 1:
+        print("Not enough distinct windows to perform noise filtering.")
+        return distinct_indices
+    
+    # Convert indices to coordinate array
+    coords = np.array(distinct_indices)
+    
+    # Calculate pairwise distances between all distinct windows
+    distances = squareform(pdist(coords))
+    
+    # For each window, calculate the average distance to k nearest neighbors
+    avg_neighbor_distances = []
+    
+    for i in range(len(distinct_indices)):
+        # Get distances to all other windows and sort
+        window_distances = distances[i]
+        # Exclude self (0 distance) and get k nearest
+        nearest_k = np.sort(window_distances)[1:k_neighbors+1]
+        avg_neighbor_distances.append(np.mean(nearest_k))
+    
+    # Convert to numpy array
+    avg_neighbor_distances = np.array(avg_neighbor_distances)
+    
+    # Calculate z-scores to identify outliers
+    z_scores = stats.zscore(avg_neighbor_distances)
+    
+    # Find indices of non-outlier windows
+    non_outlier_indices = np.where(np.abs(z_scores) <= z_threshold)[0]
+    
+    # Filter the distinct indices
+    filtered_indices = [distinct_indices[i] for i in non_outlier_indices]
+    
+    removed_count = len(distinct_indices) - len(filtered_indices)
+    print(f"Noise reduction removed {removed_count} outlier windows out of {len(distinct_indices)}.")
+    
+    return filtered_indices
 
 def visualize_window_averages(windows_grid, window_positions, original_img, color_space='RGB', 
                              threshold=None, save_path=None):
@@ -423,7 +474,7 @@ def analyze_window_statistics(windows_grid, color_space='RGB'):
         'color_variation': color_variation
     }
 
-def find_distinct_windows(windows_grid, color_space='RGB', std_threshold=1.5):
+def find_distinct_windows(windows_grid, color_space='RGB', std_threshold=1.5, reduce_noise=False):
     """
     Finds windows with colors that stand out from the overall image.
     
@@ -431,6 +482,7 @@ def find_distinct_windows(windows_grid, color_space='RGB', std_threshold=1.5):
         windows_grid: 2D grid of average colors
         color_space: Color space used ('RGB' or 'HSV')
         std_threshold: How many standard deviations from mean to consider distinct
+        reduce_noise: Whether to filter out isolated distinct windows
         
     Returns:
         distinct_indices: List of (y, x) indices of distinct windows
@@ -462,6 +514,12 @@ def find_distinct_windows(windows_grid, color_space='RGB', std_threshold=1.5):
             if np.any(std_diff > std_threshold):
                 distinct_indices.append((y, x))
     
+    # Filter noise if requested
+    original_count = len(distinct_indices)
+    if reduce_noise and original_count > 0:
+        print(f"\nApplying noise reduction to {original_count} distinct windows...")
+        distinct_indices = filter_noise_from_distinct_windows(distinct_indices)
+    
     # Print the distinct windows
     if distinct_indices:
         if color_space == 'RGB':
@@ -476,9 +534,6 @@ def find_distinct_windows(windows_grid, color_space='RGB', std_threshold=1.5):
             print(f"Window ({x},{y}) - {color_str}")
             
         # Create a visualization of distinct windows
-        # Sort by distinctiveness
-        std_diff_values.sort(key=lambda x: x[2], reverse=True)
-        
         # Create 3D scatter plot
         distinct_fig = go.Figure()
         
@@ -532,6 +587,39 @@ def find_distinct_windows(windows_grid, color_space='RGB', std_threshold=1.5):
             name='Distinct Windows'
         ))
         
+        # If noise reduction was applied, also show removed windows
+        if reduce_noise and original_count > len(distinct_indices):
+            # Find windows that were removed
+            current_set = set(distinct_indices)
+            original_set = set((y, x) for y, x in [(yx[0], yx[1]) for yx in std_diff_values if np.any(np.abs((windows_grid[yx[0], yx[1]] - mean_color) / (std_color + 1e-10)) > std_threshold)])
+            removed_set = original_set - current_set
+            
+            # Add removed windows as crosses
+            removed_x = [x for y, x in removed_set]
+            removed_y = [y for y, x in removed_set]
+            removed_text = [f"FILTERED OUT: Window ({x},{y})<br>Color: {windows_grid[y, x]}" for y, x in removed_set]
+            
+            # Convert window colors to hex
+            if color_space == 'HSV':
+                removed_colors = [rgb_to_hex(hsv_to_rgb(windows_grid[y, x])) for y, x in removed_set]
+            else:
+                removed_colors = [rgb_to_hex(windows_grid[y, x]) for y, x in removed_set]
+            
+            distinct_fig.add_trace(go.Scatter(
+                x=removed_x,
+                y=removed_y,
+                mode='markers',
+                marker=dict(
+                    size=12,
+                    color=removed_colors,
+                    symbol='x',
+                    line=dict(width=2, color='red')
+                ),
+                text=removed_text,
+                hoverinfo='text',
+                name='Filtered Out (Noise)'
+            ))
+        
         # Update layout
         distinct_fig.update_layout(
             title="Distinct Windows Detection",
@@ -560,7 +648,7 @@ def find_distinct_windows(windows_grid, color_space='RGB', std_threshold=1.5):
     return distinct_indices
 
 def process_image(image_path, color_space='RGB', window_size=100, threshold=None, 
-                 find_distinct=False, std_threshold=1.5, save_path=None):
+                 find_distinct=False, std_threshold=1.5, reduce_noise=False, save_path=None):
     """
     Process an image to visualize average colors in windows.
     
@@ -571,6 +659,7 @@ def process_image(image_path, color_space='RGB', window_size=100, threshold=None
         threshold: Optional threshold value for highlighting
         find_distinct: Whether to find windows with distinct colors
         std_threshold: How many standard deviations from mean to consider distinct
+        reduce_noise: Whether to filter out isolated distinct windows
         save_path: Optional path to save the visualization
     """
     # Check if file exists
@@ -596,7 +685,7 @@ def process_image(image_path, color_space='RGB', window_size=100, threshold=None
     
     # Find windows with distinct colors if requested
     if find_distinct:
-        distinct_windows = find_distinct_windows(windows_grid, color_space, std_threshold)
+        distinct_windows = find_distinct_windows(windows_grid, color_space, std_threshold, reduce_noise)
     
     # Visualize the results
     visualize_window_averages(windows_grid, window_positions, img, color_space, threshold, save_path)
@@ -616,6 +705,8 @@ if __name__ == "__main__":
                       help='Find windows with colors that stand out')
     parser.add_argument('--std-threshold', type=float, default=1.5,
                       help='Standard deviation threshold for distinct windows (default: 1.5)')
+    parser.add_argument('--reduce-noise', action='store_true',
+                      help='Filter out isolated distinct windows to reduce noise')
     parser.add_argument('--save', type=str, default=None,
                       help='Path to save the visualization')
     
@@ -629,6 +720,7 @@ if __name__ == "__main__":
             args.threshold,
             args.find_distinct,
             args.std_threshold,
+            args.reduce_noise,
             args.save
         )
         print("Analysis complete!")

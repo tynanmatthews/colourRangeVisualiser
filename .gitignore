@@ -1,5 +1,6 @@
 pycache/
 __pycache__/
+field_images/
 *.pyc
 *.pyo
 *.pyd
