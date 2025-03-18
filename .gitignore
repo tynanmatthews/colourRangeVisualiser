@@ -5,3 +5,16 @@ __pycache__/
 *.pyd
 *.pyw
 *.pyz
+*.jpg
+*.png
+*.jpeg
+*.gif
+*.bmp
+*.tiff
+*.ico
+*.webp
+*.heic
+*.heif
+*.hevc
+*.heif
+*.hevc
