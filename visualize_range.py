@@ -1,6 +1,7 @@
 import plotly.graph_objects as go
 import numpy as np
 from range_from_swatch import extract_colour_range_from_swatch
+import argparse
 
 def rgb_to_hex(rgb):
     """Convert RGB values to hex color string."""
@@ -35,7 +36,14 @@ def hsv_to_hex(hsv):
     rgb = [(r + m) * 255 for r in rgb]
     return rgb_to_hex(rgb)
 
-def visualize_color_range(color_range, color_space='RGB'):
+def get_vertex_colors(vertices, color_space):
+    """Get colors for each vertex."""
+    if color_space == 'RGB':
+        return [rgb_to_hex(v) for v in vertices]
+    else:  # HSV
+        return [hsv_to_hex(v) for v in vertices]
+
+def visualize_color_range(color_range, color_space='RGB', to_scale=False):
     """
     Creates an interactive 3D visualization of a color range in the browser.
     
@@ -43,6 +51,7 @@ def visualize_color_range(color_range, color_space='RGB'):
         color_range: List of two points [[min_c1, min_c2, min_c3], [max_c1, max_c2, max_c3]]
                     representing the corners of the color range
         color_space: String indicating the color space ('RGB' or 'HSV')
+        to_scale: Boolean indicating whether to show the full color space range
     """
     # Extract the min and max points
     min_point = np.array(color_range[0])
@@ -60,6 +69,9 @@ def visualize_color_range(color_range, color_space='RGB'):
         [max_point[0], max_point[1], max_point[2]]   # 111
     ])
 
+    # Get colors for each vertex
+    vertex_colors = get_vertex_colors(vertices, color_space)
+
     # Define the 6 faces of the cube (each face is a list of 4 vertex indices)
     faces = [
         [0, 1, 3, 2],  # bottom face
@@ -75,12 +87,7 @@ def visualize_color_range(color_range, color_space='RGB'):
     for face in faces:
         # Get the vertices for this face
         face_vertices = vertices[face]
-        
-        # Calculate the average color for this face
-        if color_space == 'RGB':
-            face_color = rgb_to_hex(np.mean(face_vertices, axis=0))
-        else:  # HSV
-            face_color = hsv_to_hex(np.mean(face_vertices, axis=0))
+        face_colors = [vertex_colors[i] for i in face]
         
         # Create the mesh for this face
         mesh_data.append(
@@ -91,7 +98,7 @@ def visualize_color_range(color_range, color_space='RGB'):
                 i=[0],
                 j=[1],
                 k=[2],
-                color=face_color,
+                vertexcolor=face_colors,
                 opacity=1,
                 showscale=False,
                 hoverinfo='skip'
@@ -131,18 +138,36 @@ def visualize_color_range(color_range, color_space='RGB'):
     # Set axis labels and ranges based on color space
     if color_space == 'RGB':
         axis_labels = ['Red', 'Green', 'Blue']
-        axis_ranges = {
-            'xaxis': {'range': [0, 255]},
-            'yaxis': {'range': [0, 255]},
-            'zaxis': {'range': [0, 255]}
-        }
+        if to_scale:
+            axis_ranges = {
+                'xaxis': {'range': [0, 255]},
+                'yaxis': {'range': [0, 255]},
+                'zaxis': {'range': [0, 255]}
+            }
+        else:
+            # Add some padding to the range
+            padding = 10
+            axis_ranges = {
+                'xaxis': {'range': [min_point[0] - padding, max_point[0] + padding]},
+                'yaxis': {'range': [min_point[1] - padding, max_point[1] + padding]},
+                'zaxis': {'range': [min_point[2] - padding, max_point[2] + padding]}
+            }
     else:  # HSV
         axis_labels = ['Hue', 'Saturation', 'Value']
-        axis_ranges = {
-            'xaxis': {'range': [0, 180]},  # Hue in OpenCV is 0-180
-            'yaxis': {'range': [0, 255]},  # Saturation
-            'zaxis': {'range': [0, 255]}   # Value
-        }
+        if to_scale:
+            axis_ranges = {
+                'xaxis': {'range': [0, 180]},  # Hue in OpenCV is 0-180
+                'yaxis': {'range': [0, 255]},  # Saturation
+                'zaxis': {'range': [0, 255]}   # Value
+            }
+        else:
+            # Add some padding to the range
+            padding = 10
+            axis_ranges = {
+                'xaxis': {'range': [min_point[0] - padding, max_point[0] + padding]},
+                'yaxis': {'range': [min_point[1] - padding, max_point[1] + padding]},
+                'zaxis': {'range': [min_point[2] - padding, max_point[2] + padding]}
+            }
 
     # Update layout
     fig.update_layout(
@@ -160,20 +185,21 @@ def visualize_color_range(color_range, color_space='RGB'):
     # Show the plot in the browser
     fig.show()
 
-def process_and_visualize_swatch(file_path, config):
+def process_and_visualize_swatch(file_path, config, to_scale=False):
     """
     Process a swatch image and visualize its color range.
     
     Args:
         file_path (str): Path to the swatch image
         config (dict): Configuration dictionary for color range extraction
+        to_scale (bool): Whether to show the full color space range
     """
     try:
         # Extract color range
         color_range = extract_colour_range_from_swatch(file_path, config)
         
         # Visualize the range
-        visualize_color_range(color_range, config['colour_space'])
+        visualize_color_range(color_range, config['colour_space'], to_scale)
         
         return color_range
     except Exception as e:
@@ -181,17 +207,28 @@ def process_and_visualize_swatch(file_path, config):
         raise
 
 if __name__ == "__main__":
-    # Example usage
+    parser = argparse.ArgumentParser(description='Process a swatch image and visualize its color range')
+    parser.add_argument('image_path', help='Path to the swatch image')
+    parser.add_argument('--colour-space', choices=['RGB', 'HSV'], default='RGB',
+                      help='Color space to use (default: RGB)')
+    parser.add_argument('--discrim-bands', type=int, default=3,
+                      help='Number of k-means clusters (default: 3)')
+    parser.add_argument('--retention', type=float, default=50.0,
+                      help='Percentage of points to retain (default: 50.0)')
+    parser.add_argument('--to-scale', action='store_true',
+                      help='Show the full color space range (0-255 for RGB, 0-180/255 for HSV)')
+    
+    args = parser.parse_args()
+    
     config = {
-        'colour_space': 'RGB',
-        'discrim_bands': 3,
-        'retention': 50.0
+        'colour_space': args.colour_space,
+        'discrim_bands': args.discrim_bands,
+        'retention': args.retention
     }
     
     try:
-        # Replace with your swatch image path
-        swatch_path = "path/to/your/swatch.jpg"
-        color_range = process_and_visualize_swatch(swatch_path, config)
-        print(f"Color range: {color_range}")
+        color_range = process_and_visualize_swatch(args.image_path, config, args.to_scale)
+        print(f"Successfully processed swatch. Color range: {color_range}")
     except Exception as e:
-        print(f"Error: {str(e)}") 
+        print(f"Error: {str(e)}")
+        exit(1) 
