@@ -7,6 +7,7 @@ import os
 from range_from_swatch import assert_input_colour_space
 from scipy.spatial.distance import pdist, squareform
 from scipy import stats
+from sklearn.cluster import DBSCAN
 
 def calculate_window_averages(image, window_size=100, color_space='RGB'):
     """
@@ -474,15 +475,246 @@ def analyze_window_statistics(windows_grid, color_space='RGB'):
         'color_variation': color_variation
     }
 
-def find_distinct_windows(windows_grid, color_space='RGB', std_threshold=1.5, reduce_noise=False):
+def identify_objects(windows_grid, distinct_indices, color_space='RGB', 
+                     color_weight=0.7, spatial_weight=0.3, eps=1.5, min_samples=2):
     """
-    Finds windows with colors that stand out from the overall image.
+    Identifies objects by clustering distinct windows based on color and spatial proximity.
+    
+    Args:
+        windows_grid: 2D grid of average colors
+        distinct_indices: List of (y, x) indices of distinct windows
+        color_space: Color space used ('RGB' or 'HSV')
+        color_weight: Weight for color distance (0-1)
+        spatial_weight: Weight for spatial distance (0-1)
+        eps: Maximum distance between two samples for them to be considered as in the same neighborhood
+        min_samples: Minimum number of samples in a neighborhood for a point to be considered a core point
+        
+    Returns:
+        object_labels: Array of cluster labels for each distinct window
+        merged_distinct_indices: Distinct indices array with additional column for object label
+    """
+    if len(distinct_indices) < min_samples:
+        print("Not enough distinct windows to identify objects.")
+        return np.zeros(len(distinct_indices), dtype=int), np.array([])
+    
+    # Create feature matrix with normalized spatial and color features
+    num_windows_y, num_windows_x, _ = windows_grid.shape
+    max_spatial_dist = np.sqrt(num_windows_x**2 + num_windows_y**2)
+    
+    # Extract colors for the distinct windows
+    colors = np.array([windows_grid[y, x] for y, x in distinct_indices])
+    
+    # Normalize color values based on color space
+    if color_space == 'RGB':
+        max_color_val = 255.0
+    else:  # HSV
+        # Different normalization for each channel in HSV
+        max_color_val = np.array([180.0, 255.0, 255.0])
+        colors = colors / max_color_val[:, np.newaxis].T
+    
+    # For RGB, normalize all channels together
+    if color_space == 'RGB':
+        colors = colors / max_color_val
+    
+    # Create a custom distance matrix that combines color and spatial distances
+    n_distinct = len(distinct_indices)
+    combined_dist_matrix = np.zeros((n_distinct, n_distinct))
+    
+    for i in range(n_distinct):
+        for j in range(i+1, n_distinct):
+            # Spatial distance (Euclidean)
+            y1, x1 = distinct_indices[i]
+            y2, x2 = distinct_indices[j]
+            spatial_dist = np.sqrt((x1 - x2)**2 + (y1 - y2)**2) / max_spatial_dist
+            
+            # Color distance (Euclidean in normalized color space)
+            color_dist = np.linalg.norm(colors[i] - colors[j])
+            
+            # Weighted combined distance
+            combined_dist = color_weight * color_dist + spatial_weight * spatial_dist
+            combined_dist_matrix[i, j] = combined_dist
+            combined_dist_matrix[j, i] = combined_dist
+    
+    # Apply DBSCAN clustering using the precomputed distance matrix
+    db = DBSCAN(eps=eps, min_samples=min_samples, metric='precomputed')
+    object_labels = db.fit_predict(combined_dist_matrix)
+    
+    # Count the number of objects found (excluding noise with label -1)
+    n_objects = len(set(object_labels[object_labels >= 0]))
+    print(f"Identified {n_objects} distinct objects in the image.")
+    
+    # Merge distinct indices with object labels
+    merged_distinct_indices = np.column_stack((distinct_indices, object_labels))
+    
+    return object_labels, merged_distinct_indices
+
+def visualize_object_clusters(windows_grid, merged_distinct_indices, original_img, color_space='RGB', save_path=None):
+    """
+    Visualizes the identified object clusters.
+    
+    Args:
+        windows_grid: 2D grid of average colors
+        merged_distinct_indices: Distinct indices array with object labels
+        original_img: Original image
+        color_space: Color space used ('RGB' or 'HSV')
+        save_path: Optional path to save the visualization
+    """
+    # Extract distinct indices and object labels
+    distinct_indices = merged_distinct_indices[:, :2].astype(int)
+    object_labels = merged_distinct_indices[:, 2].astype(int)
+    
+    # Convert original image to RGB for display
+    orig_img_rgb = cv2.cvtColor(original_img, cv2.COLOR_BGR2RGB)
+    
+    # Create a figure to visualize the objects
+    object_fig = go.Figure()
+    object_fig.add_trace(go.Image(z=orig_img_rgb))
+    
+    # Get num_windows_x and num_windows_y from windows_grid shape
+    num_windows_y, num_windows_x, _ = windows_grid.shape
+    window_size = 100  # Default window size
+    
+    # Define a colormap for different object labels
+    import matplotlib.cm as cm
+    import matplotlib.colors as mcolors
+    
+    # Get unique object labels (excluding noise with label -1)
+    unique_objects = sorted(set(object_labels[object_labels >= 0]))
+    n_objects = len(unique_objects)
+    
+    # Create a colormap with distinct colors
+    if n_objects > 0:
+        colormap = cm.get_cmap('tab10', max(10, n_objects))
+        object_colors = {label: mcolors.rgb2hex(colormap(i)[:3]) for i, label in enumerate(unique_objects)}
+        
+        # Add noise in grey if there's any
+        if -1 in object_labels:
+            object_colors[-1] = '#808080'  # Grey for noise
+    else:
+        object_colors = {-1: '#808080'}  # Grey for noise if only noise exists
+    
+    # Create window positions
+    window_positions = np.zeros((num_windows_y, num_windows_x, 4), dtype=np.int32)
+    for y in range(num_windows_y):
+        for x in range(num_windows_x):
+            x1 = x * window_size
+            y1 = y * window_size
+            window_positions[y, x] = [x1, y1, window_size, window_size]
+    
+    # Add rectangles and labels for each object
+    for label in sorted(set(object_labels)):
+        label_indices = [i for i, obj_label in enumerate(object_labels) if obj_label == label]
+        if label == -1:
+            rect_color = "gray"  # Noise points
+            alpha = 0.2
+            title = "Noise"
+        else:
+            rect_color = object_colors[label]
+            alpha = 0.4
+            title = f"Object {label}"
+        
+        # Create a polygon outline to connect all windows in this object
+        if label >= 0 and len(label_indices) > 2:  # Only for actual objects with enough points
+            # Extract window coordinates (center points)
+            points_y = [distinct_indices[i][0] * window_size + window_size//2 for i in label_indices]
+            points_x = [distinct_indices[i][1] * window_size + window_size//2 for i in label_indices]
+            
+            # Compute the convex hull of these points
+            if len(points_y) >= 3:  # Need at least 3 points for a convex hull
+                try:
+                    from scipy.spatial import ConvexHull
+                    points = np.column_stack([points_x, points_y])
+                    hull = ConvexHull(points)
+                    hull_points_x = [points[hull.vertices, 0]]
+                    hull_points_y = [points[hull.vertices, 1]]
+                    
+                    # Add the hull outline
+                    object_fig.add_trace(go.Scatter(
+                        x=np.append(hull_points_x, hull_points_x[0][0]),
+                        y=np.append(hull_points_y, hull_points_y[0][0]),
+                        mode='lines',
+                        line=dict(color=rect_color, width=3),
+                        name=title,
+                        showlegend=True
+                    ))
+                except Exception as e:
+                    print(f"Could not compute convex hull for object {label}: {str(e)}")
+        
+        # Add individual window rectangles
+        for i in label_indices:
+            y, x = distinct_indices[i]
+            pos = window_positions[y, x]
+            
+            # Add rectangle shape
+            object_fig.add_shape(
+                type="rect",
+                x0=pos[0], y0=pos[1], 
+                x1=pos[0] + pos[2], y1=pos[1] + pos[3],
+                line=dict(color=rect_color, width=2),
+                fillcolor="plum",
+                name=title,
+                showlegend=False
+            )
+            
+            # Add label for the first window of each object
+            if i == label_indices[0]:
+                object_fig.add_annotation(
+                    x=pos[0] + pos[2]//2, 
+                    y=pos[1] + pos[3]//2,
+                    text=title,
+                    showarrow=True,
+                    arrowhead=2,
+                    arrowsize=1,
+                    arrowwidth=2,
+                    arrowcolor=rect_color,
+                    font=dict(color="white", size=12),
+                    bgcolor="plum",
+                    bordercolor="white",
+                    borderwidth=1,
+                    borderpad=4
+                )
+    
+    # Update layout
+    object_fig.update_layout(
+        title_text="Identified Objects",
+        height=800,
+        width=1000,
+        showlegend=True,
+        legend=dict(
+            title="Objects",
+            yanchor="top",
+            y=0.99,
+            xanchor="left",
+            x=0.01,
+            bgcolor="rgba(255,255,255,0.8)"
+        )
+    )
+    
+    # Fix aspect ratio
+    object_fig.update_xaxes(showticklabels=False, visible=False)
+    object_fig.update_yaxes(showticklabels=False, visible=False)
+    
+    # Show the figure
+    object_fig.show()
+    
+    # Save the visualization if a path is provided
+    if save_path:
+        base, ext = os.path.splitext(save_path)
+        object_fig.write_html(f"{base}_objects.html")
+        object_fig.write_image(f"{base}_objects{ext}")
+    
+    return object_fig
+
+def find_distinct_windows(windows_grid, color_space='RGB', std_threshold=1.5, reduce_noise=False, identify_objects_flag=False):
+    """
+    Finds windows with colors that stand out from the overall image and identifies objects.
     
     Args:
         windows_grid: 2D grid of average colors
         color_space: Color space used ('RGB' or 'HSV')
         std_threshold: How many standard deviations from mean to consider distinct
         reduce_noise: Whether to filter out isolated distinct windows
+        identify_objects_flag: Whether to identify and visualize objects
         
     Returns:
         distinct_indices: List of (y, x) indices of distinct windows
@@ -590,8 +822,14 @@ def find_distinct_windows(windows_grid, color_space='RGB', std_threshold=1.5, re
         # If noise reduction was applied, also show removed windows
         if reduce_noise and original_count > len(distinct_indices):
             # Find windows that were removed
-            current_set = set(distinct_indices)
-            original_set = set((y, x) for y, x in [(yx[0], yx[1]) for yx in std_diff_values if np.any(np.abs((windows_grid[yx[0], yx[1]] - mean_color) / (std_color + 1e-10)) > std_threshold)])
+            current_set = set(tuple(idx) for idx in distinct_indices)
+            original_set = set()
+            for y, x, _ in std_diff_values:
+                window_color = windows_grid[y, x]
+                std_diff = np.abs(window_color - mean_color) / (std_color + 1e-10)
+                if np.any(std_diff > std_threshold):
+                    original_set.add((y, x))
+            
             removed_set = original_set - current_set
             
             # Add removed windows as crosses
@@ -642,15 +880,22 @@ def find_distinct_windows(windows_grid, color_space='RGB', std_threshold=1.5, re
         
         # Show the figure
         distinct_fig.show()
+        
+        # Identify objects if requested
+        if identify_objects_flag and len(distinct_indices) >= 2:
+            object_labels, merged_indices = identify_objects(windows_grid, distinct_indices, color_space)
+            return distinct_indices, object_labels, merged_indices
+        
     else:
         print("\nNo distinctly colored windows found.")
     
-    return distinct_indices
+    return distinct_indices, None, None
 
 def process_image(image_path, color_space='RGB', window_size=100, threshold=None, 
-                 find_distinct=False, std_threshold=1.5, reduce_noise=False, save_path=None):
+                 find_distinct=False, std_threshold=1.5, reduce_noise=False, 
+                 identify_objects_flag=False, color_weight=0.7, save_path=None):
     """
-    Process an image to visualize average colors in windows.
+    Process an image to visualize average colors in windows and identify objects.
     
     Args:
         image_path: Path to the input image
@@ -660,6 +905,8 @@ def process_image(image_path, color_space='RGB', window_size=100, threshold=None
         find_distinct: Whether to find windows with distinct colors
         std_threshold: How many standard deviations from mean to consider distinct
         reduce_noise: Whether to filter out isolated distinct windows
+        identify_objects_flag: Whether to identify and visualize objects
+        color_weight: Weight for color distance in object identification (0-1)
         save_path: Optional path to save the visualization
     """
     # Check if file exists
@@ -684,13 +931,20 @@ def process_image(image_path, color_space='RGB', window_size=100, threshold=None
     visualize_3d_color_distribution(windows_grid, color_space)
     
     # Find windows with distinct colors if requested
+    object_labels = None
+    merged_indices = None
     if find_distinct:
-        distinct_windows = find_distinct_windows(windows_grid, color_space, std_threshold, reduce_noise)
+        distinct_indices, object_labels, merged_indices = find_distinct_windows(
+            windows_grid, color_space, std_threshold, reduce_noise, identify_objects_flag)
+        
+        # Visualize identified objects if requested
+        if identify_objects_flag and merged_indices is not None:
+            visualize_object_clusters(windows_grid, merged_indices, img, color_space, save_path)
     
     # Visualize the results
-    visualize_window_averages(windows_grid, window_positions, img, color_space, threshold, save_path)
+    # visualize_window_averages(windows_grid, window_positions, img, color_space, threshold, save_path)
     
-    return windows_grid, window_positions, statistics
+    return windows_grid, window_positions, statistics, object_labels
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Analyze average colors in image windows')
@@ -707,6 +961,10 @@ if __name__ == "__main__":
                       help='Standard deviation threshold for distinct windows (default: 1.5)')
     parser.add_argument('--reduce-noise', action='store_true',
                       help='Filter out isolated distinct windows to reduce noise')
+    parser.add_argument('--identify-objects', action='store_true',
+                      help='Identify distinct objects in the image')
+    parser.add_argument('--color-weight', type=float, default=0.7,
+                      help='Weight for color distance in object identification (0-1, default: 0.7)')
     parser.add_argument('--save', type=str, default=None,
                       help='Path to save the visualization')
     
@@ -721,6 +979,8 @@ if __name__ == "__main__":
             args.find_distinct,
             args.std_threshold,
             args.reduce_noise,
+            args.identify_objects,
+            args.color_weight,
             args.save
         )
         print("Analysis complete!")
